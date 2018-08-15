@@ -15,12 +15,33 @@ object CoursierResolver {
   // 12 concurrent downloads
   // most downloads are tiny sha downloads so try keep things alive
   lazy val downloadPool = Schedulable.fixedThreadPool(12)
+
+import java.io.File
+  val cacheLogger = new coursier.Cache.Logger {
+      override def foundLocally(url: String, file: File): Unit = {
+        System.err.println(s"found $url at ${file}")
+      }
+      override def downloadingArtifact(url: String, file: File): Unit = {
+        System.err.println(s"downloading $url to ${file}")
+      }
+      override def downloadedArtifact(url: String, success: Boolean): Unit = {
+        System.err.println(s"downloaded $url: $success")
+      }
+      def removedCorruptFile(url: String, file: File, reason: Option[coursier.FileError]): Unit = {
+        println(s"""
+          Removing corrupt file $file from url: $url
+          """)
+      }
+
+    }
+
 }
 class CoursierResolver(servers: List[MavenServer], ec: ExecutionContext, runTimeout: Duration) extends Resolver[Task] {
   // TODO: add support for a local file cache other than ivy
   private[this] val repos = Cache.ivy2Local :: servers.map { ms => coursier.MavenRepository(ms.url) }
 
-  private[this] val fetch = Fetch.from(repos, Cache.fetch[Task](cachePolicy = CachePolicy.FetchMissing, pool = CoursierResolver.downloadPool))
+  private[this] val fetch = Fetch.from(repos, Cache.fetch[Task](cachePolicy = CachePolicy.FetchMissing, pool = CoursierResolver.downloadPool,
+          logger = Some(CoursierResolver.cacheLogger)))
 
   private[this] val logger = LoggerFactory.getLogger("bazel_deps.CoursierResolver")
 
@@ -70,7 +91,9 @@ class CoursierResolver(servers: List[MavenServer], ec: ExecutionContext, runTime
         }
 
       def downloadSha(digestType: DigestType, a: coursier.Artifact): Task[Option[ShaValue]] =
-        Cache.file[Task](a, cachePolicy = CachePolicy.FetchMissing, pool = CoursierResolver.downloadPool).run.map {
+        Cache.file[Task](a, cachePolicy = CachePolicy.FetchMissing,
+          pool = CoursierResolver.downloadPool,
+          logger = Some(CoursierResolver.cacheLogger)).run.map {
           case Left(error) =>
             logger.info(s"failure to download ${a.url}, ${error.describe}")
             None
@@ -83,7 +106,8 @@ class CoursierResolver(servers: List[MavenServer], ec: ExecutionContext, runTime
         }
 
       def computeSha(digestType: DigestType, artifact: coursier.Artifact): Task[ShaValue] =
-        Cache.file[Task](artifact, cachePolicy = CachePolicy.FetchMissing, pool = CoursierResolver.downloadPool).run.flatMap { e =>
+        Cache.file[Task](artifact, cachePolicy = CachePolicy.FetchMissing, pool = CoursierResolver.downloadPool,
+          logger = Some(CoursierResolver.cacheLogger)).run.flatMap { e =>
           resolverMonad.fromTry(e match {
             case Left(error) =>
               Failure(FileErrorException(error))
@@ -118,27 +142,7 @@ class CoursierResolver(servers: List[MavenServer], ec: ExecutionContext, runTime
                 computeShas(DigestType.Sha1, artifacts)
               }
             }
-
-            // Coursier has some artifact data in extra for checksums, but has a far more complete
-            // checksumUrls attribute
-            //
-            // The SHA-1 availability as an artifact appears to be far more complete, so we only do this
-            // for the SHA-256
-            val sha256Artifacts = maybeArtifacts.flatMap(_.extra.get("SHA-256")) match {
-              case Nil =>
-                maybeArtifacts.flatMap { a =>
-                  a.checksumUrls.get("SHA-256").map{u => a.copy(url = u)}
-                }
-              case o => o
-            }
-
-            val sha256 = downloadShas(DigestType.Sha256, sha256Artifacts).flatMap {
-              case Some(s) => Task.point(s)
-              case None =>{
-                logger.info(s"Preforming cached fetch to execute SHA-256 calculation for ${artifacts.head}")
-                computeShas(DigestType.Sha256, artifacts)
-              }
-            }
+            val sha256 = computeShas(DigestType.Sha256, artifacts)
 
             (for {
               sha1 <- sha1
@@ -153,7 +157,8 @@ class CoursierResolver(servers: List[MavenServer], ec: ExecutionContext, runTime
 
       val module = coursier.Module(c.group.asString, c.artifact.artifactId, Map.empty)
       val version = c.version.asString
-      val f = Cache.fetch[Task](checksums = Seq(Some("SHA-1"), None), cachePolicy = CachePolicy.FetchMissing, pool = CoursierResolver.downloadPool)
+      val f = Cache.fetch[Task](checksums = Seq(Some("SHA-1"), None), cachePolicy = CachePolicy.FetchMissing, pool = CoursierResolver.downloadPool,
+          logger = Some(CoursierResolver.cacheLogger))
       val task = Fetch.find[Task](repos, module, version, f).run
 
       /*
@@ -166,7 +171,8 @@ class CoursierResolver(servers: List[MavenServer], ec: ExecutionContext, runTime
        *
        * See cats.Parallel for this.
        */
-      Nested[Task, L, ResolvedShasValue](task.flatMap {
+
+       Nested[Task, L, ResolvedShasValue](task.flatMap {
         case Left(errors) =>
           val nel = NonEmptyList.fromList(errors.toList)
             .getOrElse(NonEmptyList("<empty message>", Nil))
@@ -182,7 +188,11 @@ class CoursierResolver(servers: List[MavenServer], ec: ExecutionContext, runTime
             "sources"
           ))
 
-          processArtifact(src, dep, proj).flatMap { mainJarDescriptorOpt =>
+          val rt = processArtifact(src, dep, proj).value
+       val evaluated = rt(ec)
+        val updatedRt = Task(_ => evaluated)
+
+          updatedRt.flatMap { mainJarDescriptorOpt =>
             resolverMonad.handleErrorWith(processArtifact(src, srcDep, proj)){_ => Task.point(None)}.flatMap { sourceJarDescriptorOpt =>
                 mainJarDescriptorOpt match {
                 case None => resolverMonad.raiseError(new RuntimeException(s"no artifacts for ${c.asString} found")) : Task[ResolvedShasValue]
@@ -200,7 +210,10 @@ class CoursierResolver(servers: List[MavenServer], ec: ExecutionContext, runTime
     val g: MavenCoordinate => N[(MavenCoordinate, ResolvedShasValue)] =
       x => lookup(x).map(x -> _)
 
-    Traverse[List].traverse(m)(g).value.flatMap {
+    // val r: N[List[(MavenCoordinate, ResolvedShasValue)]] = Traverse[List].traverse(m)(g)
+    val r: N[List[(MavenCoordinate, ResolvedShasValue)]] = m.map(g).sequence
+
+    r.value.flatMap {
       case Validated.Valid(xs) =>
         Task.point(SortedMap(xs: _*))
       case Validated.Invalid(errors) =>
