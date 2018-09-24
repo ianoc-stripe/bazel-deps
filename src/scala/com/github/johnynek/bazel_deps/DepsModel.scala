@@ -590,14 +590,20 @@ case class ProjectRecord(
   override lazy val hashCode: Int =
     (lang, version, modules, exports, exclude, processorClasses).hashCode
 
+  private[this] val flatteningCache = new scala.collection.mutable.Map[ArtifactOrProject, List[(ArtifactOrProject, ProjectRecord)]]()
   def flatten(ap: ArtifactOrProject): List[(ArtifactOrProject, ProjectRecord)] ={
-    println(s"Flattening $ap from $this")
-    getModules match {
+    flatteningCache.get(ap) match {
+      case Some(e) => e
+case None =>
+  val r = getModules match {
       case Nil => List((ap, copy(modules = None)))
       case mods => mods.map { sp =>
         (ap.toArtifact(sp), copy(modules = None))
       }
     }
+    flatteningCache += (ap, r)
+    r
+  }
   }
 
   def normalizeEmptyModule: ProjectRecord =
