@@ -590,13 +590,15 @@ case class ProjectRecord(
   override lazy val hashCode: Int =
     (lang, version, modules, exports, exclude, processorClasses).hashCode
 
-  def flatten(ap: ArtifactOrProject): List[(ArtifactOrProject, ProjectRecord)] =
+  def flatten(ap: ArtifactOrProject): List[(ArtifactOrProject, ProjectRecord)] ={
+    println(s"Flattening $ap from $this")
     getModules match {
       case Nil => List((ap, copy(modules = None)))
       case mods => mods.map { sp =>
         (ap.toArtifact(sp), copy(modules = None))
       }
     }
+  }
 
   def normalizeEmptyModule: ProjectRecord =
     getModules match {
