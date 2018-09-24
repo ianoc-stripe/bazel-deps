@@ -27,10 +27,11 @@ import java.io.File
       override def downloadedArtifact(url: String, success: Boolean): Unit = {
         System.err.println(s"downloaded $url: $success")
       }
-      def removedCorruptFile(url: String, file: File, reason: Option[coursier.FileError]): Unit = {
+      override def removedCorruptFile(url: String, file: File, reason: Option[coursier.FileError]): Unit = {
         println(s"""
           Removing corrupt file $file from url: $url
           """)
+        super(url, file, reason)
       }
 
     }
