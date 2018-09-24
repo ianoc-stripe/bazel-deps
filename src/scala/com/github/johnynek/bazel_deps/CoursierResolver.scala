@@ -31,7 +31,7 @@ import java.io.File
         println(s"""
           Removing corrupt file $file from url: $url
           """)
-        super(url, file, reason)
+        super.removedCorruptFile(url, file, reason)
       }
 
     }
